@@ -1,0 +1,21 @@
+{
+    "modifiers": [
+        "low",
+        "high",
+        "top",
+        "dark",
+        "light",
+        "budget",
+        "fast",
+        "cheap",
+        "expensive",
+        "vibrant",
+        "new",
+        "latest"
+    ],
+    "synonyms": {
+        "affordable": "cheap",
+        "budget-friendly": "cheap",
+        "performance": "fast"
+    }
+}
