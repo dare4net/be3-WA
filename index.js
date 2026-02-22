@@ -14,6 +14,7 @@ const QuestionWrapper = require('./questionWrapper');
 const ContextMemory = require('./contextMemory');
 const { cleanForTranslator } = require('./textUtils');
 const holisticStrategy = require('./holisticStrategy');
+const { sendInteractiveMessage } = require('baileys_helper');
 
 // Multi-user state management
 const userSessions = new Map();
@@ -109,6 +110,36 @@ async function connectToWhatsApp() {
                 for (const msg of messages) {
                     if (!msg.key.fromMe && msg.message) {
                         const from = msg.key.remoteJid;
+                        // Handle button responses - native flow (interactive) or legacy template buttons
+                        const nativeFlow = msg.message.interactiveResponseMessage?.nativeFlowResponseMessage;
+                        const legacyBtn = msg.message.buttonsResponseMessage;
+                        if (nativeFlow) {
+                            // Native flow response: paramsJson contains { id } for quick_reply
+                            let buttonId = null;
+                            let displayText = null;
+                            try {
+                                const params = nativeFlow.paramsJson ? JSON.parse(nativeFlow.paramsJson) : {};
+                                buttonId = params.id || nativeFlow.name;
+                                displayText = params.display_text;
+                            } catch (_) {
+                                buttonId = nativeFlow.name;
+                            }
+                            console.log(`[BOT] Button clicked (native flow): ${buttonId} -> forwarding to AI`);
+                            const text = buttonId === 'ms_yes' ? 'yes' : buttonId === 'ms_no' ? 'no' : (displayText || buttonId || '');
+                            await handleMessage(sock, from, text);
+                            continue;
+                        }
+                        if (legacyBtn) {
+                            const buttonId = legacyBtn.selectedButtonId;
+                            const buttonText = legacyBtn.selectedDisplayText;
+                            console.log(`[BOT] Button clicked (legacy): ${buttonId} (${buttonText})`);
+                            const text = (buttonId === 'ms_yes' || buttonText?.toLowerCase() === 'yes') ? 'yes'
+                                : (buttonId === 'ms_no' || buttonText?.toLowerCase() === 'no') ? 'no'
+                                : (buttonId || buttonText || '');
+                            await handleMessage(sock, from, text);
+                            continue;
+                        }
+                        // Handle regular text messages
                         const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
                         if (text) await handleMessage(sock, from, text);
                     }
@@ -262,8 +293,33 @@ async function handleMessage(sock, from, text) {
                         return startCheckout(sock, from);
                     }
 
-                    // Send the text reply first
-                    await sock.sendMessage(from, { text: aiRes.data.reply });
+                    // Check for WhatsApp buttons (from microstate tools)
+                    const whatsappButtons = aiRes.data.whatsapp_buttons || 
+                        (aiRes.data.results && aiRes.data.results.find(r => r.result?.whatsapp)?.result?.whatsapp);
+                    
+                    if (whatsappButtons && whatsappButtons.type === 'button' && whatsappButtons.buttons?.length > 0) {
+                        // Use baileys_helper - explicit quick_reply format for Yes/No buttons
+                        const btnList = whatsappButtons.buttons;
+                        console.log(`[BOT] Sending WhatsApp buttons: ${btnList.length} (${btnList.map(b => b.title || b.text || b.id).join(', ')})`);
+                        try {
+                            await sendInteractiveMessage(sock, from, {
+                                text: aiRes.data.reply + '\n\n_Or type Yes / No if buttons don\'t appear._',
+                                interactiveButtons: btnList.map(btn => ({
+                                    name: 'quick_reply',
+                                    buttonParamsJson: JSON.stringify({
+                                        display_text: btn.title || btn.text || btn.id,
+                                        id: btn.id
+                                    })
+                                }))
+                            });
+                        } catch (buttonErr) {
+                            console.error(`[BOT] Failed to send buttons, falling back to text: ${buttonErr.message}`);
+                            await sock.sendMessage(from, { text: aiRes.data.reply });
+                        }
+                    } else {
+                        // Send plain text message
+                        await sock.sendMessage(from, { text: aiRes.data.reply });
+                    }
 
                     // --- INTELLIGENT IMAGE SENDING (Phase 17) ---
                     // Use the AI service's smart image filtering with bot-level deduplication
@@ -278,21 +334,27 @@ async function handleMessage(sock, from, text) {
                         let sentCount = 0;
                         for (const img of aiRes.data.display_images) {
                             try {
+                                // Handle both string URLs and object format {url, caption}
+                                const imgUrl = typeof img === 'string' ? img : img.url;
+                                const imgCaption = typeof img === 'string' ? '' : (img.caption || '');
+
+                                if (!imgUrl) continue;
+
                                 // Check if this image was sent recently
-                                const lastSent = session.imageHistory.get(img.url);
+                                const lastSent = session.imageHistory.get(imgUrl);
                                 if (lastSent && (now - lastSent) < IMAGE_COOLDOWN_MS) {
-                                    console.log(`[BOT] Skipping duplicate image: ${img.caption} (sent ${Math.round((now - lastSent) / 1000)}s ago)`);
+                                    console.log(`[BOT] Skipping duplicate image: ${imgUrl}`);
                                     continue;
                                 }
 
-                                console.log(`[BOT] Sending image: ${img.caption}`);
+                                console.log(`[BOT] Sending image: ${imgUrl}`);
                                 await sock.sendMessage(from, {
-                                    image: { url: img.url },
-                                    caption: img.caption
+                                    image: { url: imgUrl },
+                                    caption: imgCaption
                                 });
 
                                 // Track this image
-                                session.imageHistory.set(img.url, now);
+                                session.imageHistory.set(imgUrl, now);
                                 sentCount++;
 
                                 // Clean up old history (keep map from growing infinitely)

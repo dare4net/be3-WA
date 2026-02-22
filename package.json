@@ -12,6 +12,7 @@
   "type": "commonjs",
   "dependencies": {
     "@hapi/boom": "^10.0.1",
+    "baileys_helper": "^1.0.6",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "axios": "^1.13.5",
     "dotenv": "^17.2.4",
