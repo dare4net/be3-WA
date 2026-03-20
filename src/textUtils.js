@@ -32,7 +32,7 @@ function cleanForTranslator(text) {
     return cleaned;
 }
 
-module.exports = {
+export {
     stripEmojis,
     normalizeText,
     cleanForTranslator

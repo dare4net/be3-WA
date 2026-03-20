@@ -87,4 +87,4 @@ class QuestionWrapper {
     }
 }
 
-module.exports = QuestionWrapper;
+export default QuestionWrapper;

@@ -1,8 +1,13 @@
-const db = require('./db');
-const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
-const { cleanForTranslator } = require('./textUtils');
+import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+import db from './db.js';
+import { cleanForTranslator } from './textUtils.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 /**
  * Holistic Strategy - Zero-Hardcoding Dynamic Filter Extraction
@@ -18,7 +23,7 @@ class HolisticStrategy {
         this.modifiers = [];
         this.synonyms = {};
         try {
-            const adjPath = path.join(__dirname, 'adjectives.json');
+            const adjPath = path.join(__dirname, '../adjectives.json');
             if (fs.existsSync(adjPath)) {
                 const data = JSON.parse(fs.readFileSync(adjPath, 'utf8'));
                 this.modifiers = data.modifiers || [];
@@ -34,7 +39,7 @@ class HolisticStrategy {
         // Single Source of Truth: Canonical Terms
         this.dictionary = [];
         try {
-            const dictionaryPath = path.join(__dirname, '../be3_translator/canonical_terms.json');
+            const dictionaryPath = path.join(__dirname, '../../be3_translator/canonical_terms.json');
             if (fs.existsSync(dictionaryPath)) {
                 this.dictionary = JSON.parse(fs.readFileSync(dictionaryPath, 'utf8'));
                 console.log(`[HOLISTIC] Loaded ${this.dictionary.length} canonical terms for context.`);
@@ -371,4 +376,4 @@ class HolisticStrategy {
     }
 }
 
-module.exports = new HolisticStrategy();
+export default new HolisticStrategy();

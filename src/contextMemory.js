@@ -76,4 +76,4 @@ class ContextMemory {
     }
 }
 
-module.exports = ContextMemory;
+export default ContextMemory;
