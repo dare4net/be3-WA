@@ -10,7 +10,7 @@ import ContextMemory from './contextMemory.js';
 import holisticStrategy from './holisticStrategy.js';
 import QuestionWrapper from './questionWrapper.js';
 import { cleanForTranslator } from './textUtils.js';
-import { describeInboundMessage, extractInboundText } from './wa/inbound.js';
+import { describeInboundMessage, extractInboundText, isImageMessage } from './wa/inbound.js';
 import UiRegistry from './ui/uiRegistry.js';
 import { resolveUiCallback } from './ui/callbackRouter.js';
 
@@ -25,6 +25,8 @@ const {
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
+    prepareWAMessageMedia,
+    downloadMediaMessage,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const qrcode = require('qrcode-terminal');
@@ -145,7 +147,30 @@ async function connectToWhatsApp() {
                     if (!msg.key.fromMe && msg.message) {
                         const from = msg.key.remoteJid;
                         const text = extractInboundText(msg);
-                        if (text) {
+                        const isImage = isImageMessage(msg);
+
+                        if (isImage) {
+                            console.log(`[BOT] Received image from ${from}. Downloading...`);
+                            try {
+                                const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+                                    logger: pino({ level: 'silent' }),
+                                    readeableStream: true
+                                });
+
+                                const sharp = require('sharp');
+                                const compressedBuffer = await sharp(buffer)
+                                    .resize({ width: 800, height: 800, fit: 'inside', withoutEnlargement: true })
+                                    .jpeg({ quality: 80 })
+                                    .toBuffer();
+
+                                const mimeType = 'image/jpeg'; // always jpeg after sharp processing
+                                const base64Image = `data:${mimeType};base64,${compressedBuffer.toString('base64')}`;
+                                await handleMessage(sock, from, text || '', base64Image);
+                            } catch (err) {
+                                console.error('[BOT] Failed to download media:', err);
+                                await sock.sendMessage(from, { text: "I'm sorry, I couldn't process that image. Please try again! 😔" });
+                            }
+                        } else if (text) {
                             await handleMessage(sock, from, text);
                         } else {
                             console.log(`[BOT] Unhandled inbound message type(s): ${describeInboundMessage(msg)}`);
@@ -255,7 +280,7 @@ async function sendMenu(sock, from) {
     }
 }
 
-async function handleMessage(sock, from, text) {
+async function handleMessage(sock, from, text, image = null) {
     try {
         const uiCb = resolveUiCallback(uiRegistry, text);
         if (uiCb?.handled) {
@@ -303,6 +328,7 @@ async function handleMessage(sock, from, text) {
 
                 const aiRes = await axios.post('http://localhost:3005/chat', {
                     message: rawText,
+                    image: image,
                     session_id: from,
                     history: session.history.slice(0, -1) // Send previous history, not current msg (server adds it)
                 });
@@ -320,14 +346,14 @@ async function handleMessage(sock, from, text) {
                     const hasImages = Array.isArray(aiRes.data.display_images) && aiRes.data.display_images.length > 0;
 
                     // Check for WhatsApp buttons (global aggregated buttons)
-                    const whatsappButtons = aiRes.data.whatsapp_buttons || 
+                    const whatsappButtons = aiRes.data.whatsapp_buttons ||
                         (aiRes.data.results && aiRes.data.results.find(r => r.result?.whatsapp)?.result?.whatsapp);
 
                     if (process.env.DEBUG_WA_BUTTONS === 'true') {
                         try {
                             console.log('[BOT][DEBUG_WA_BUTTONS] /chat response whatsapp_buttons:', JSON.stringify(aiRes.data.whatsapp_buttons || null));
                             console.log('[BOT][DEBUG_WA_BUTTONS] derived whatsappButtons:', JSON.stringify(whatsappButtons || null));
-                        } catch (_) {}
+                        } catch (_) { }
                     }
 
                     // Product cards are sent as an additional message stream
@@ -408,7 +434,7 @@ async function handleMessage(sock, from, text) {
                                         text: aiRes.data.reply,
                                         buttons: wrappedButtons
                                     }));
-                                } catch (_) {}
+                                } catch (_) { }
                             }
                             await sendInteractiveMessage(sock, from, {
                                 text: aiRes.data.reply + '\n\n_Or type Yes / No if buttons don\'t appear._',
@@ -440,47 +466,10 @@ async function handleMessage(sock, from, text) {
                             const cardText = card.text || '';
                             const btnList = Array.isArray(card.buttons) ? card.buttons : [];
 
-                            let imageTxOk = true;
                             const imgUrl = card.image_url || card.imageUrl || null;
                             const imgCaption = card.caption || '';
-                            if (imgUrl) {
-                                if (!session.imageHistory) session.imageHistory = new Map();
-                                const now = Date.now();
-                                const IMAGE_COOLDOWN_MS = 10 * 60 * 1000;
-                                const lastSent = session.imageHistory.get(imgUrl);
-                                const shouldSkip = lastSent && (now - lastSent) < IMAGE_COOLDOWN_MS;
-                                if (shouldSkip) {
-                                    console.log(`[BOT] Skipping duplicate image (tx-ok): ${imgUrl}`);
-                                } else {
-                                    try {
-                                        console.log(`[BOT] Sending image (tx): ${imgUrl}`);
-                                        await sock.sendMessage(from, {
-                                            image: { url: imgUrl },
-                                            caption: imgCaption
-                                        });
-                                        session.imageHistory.set(imgUrl, now);
-                                        if (session.imageHistory.size > 50) {
-                                            const oldestKey = session.imageHistory.keys().next().value;
-                                            session.imageHistory.delete(oldestKey);
-                                        }
-                                    } catch (imgErr) {
-                                        imageTxOk = false;
-                                        console.error(`[BOT] Failed to send image (tx): ${imgErr.message}`);
-                                    }
-                                }
-                            }
 
-                            if (!imageTxOk) {
-                                if (cardText) await sock.sendMessage(from, { text: cardText });
-                                continue;
-                            }
-
-                            if (!btnList.length) {
-                                if (cardText) await sock.sendMessage(from, { text: cardText });
-                                continue;
-                            }
-
-                            let wrappedButtons = btnList;
+                            // 1. Build wrapped buttons with UI Registry
                             const sponsor = card.sponsor || productCardPayload.sponsor || { type: 'product_card' };
                             const actions = btnList.map((btn, i) => {
                                 const actionKey = `a${i + 1}`;
@@ -493,25 +482,62 @@ async function handleMessage(sock, from, text) {
                                 };
                             });
                             const entry = uiRegistry.create({ sponsor, actions });
-                            wrappedButtons = btnList.map((btn, i) => ({
+                            const wrappedButtons = btnList.map((btn, i) => ({
                                 ...btn,
                                 id: UiRegistry.buildActionToken(entry.token, `a${i + 1}`)
                             }));
 
-                            console.log(`[BOT] Sending product card buttons: ${btnList.length} (card ${idx + 1}/${cards.length})`);
+                            // 2. Prepare Interactive Message Header (Image)
+                            let header = { title: card.name || card.title || 'Product Info' };
+                            if (imgUrl) {
+                                if (!session.imageHistory) session.imageHistory = new Map();
+                                const now = Date.now();
+                                const IMAGE_COOLDOWN_MS = 10 * 60 * 1000;
+                                const lastSent = session.imageHistory.get(imgUrl);
+                                const shouldSkip = lastSent && (now - lastSent) < IMAGE_COOLDOWN_MS;
+
+                                if (!shouldSkip) {
+                                    try {
+                                        console.log(`[BOT] Preparing image header for card ${idx + 1}: ${imgUrl}`);
+                                        const media = await prepareWAMessageMedia({ image: { url: imgUrl } }, { upload: sock.waUploadToServer });
+                                        header = {
+                                            title: card.name || card.title || 'Product Info',
+                                            hasMediaAttachment: true,
+                                            imageMessage: media.imageMessage
+                                        };
+                                        session.imageHistory.set(imgUrl, now);
+                                        if (session.imageHistory.size > 50) {
+                                            const oldestKey = session.imageHistory.keys().next().value;
+                                            session.imageHistory.delete(oldestKey);
+                                        }
+                                    } catch (imgErr) {
+                                        console.error(`[BOT] Failed to prepare image header: ${imgErr.message}`);
+                                    }
+                                } else {
+                                    console.log(`[BOT] Skipping duplicate image for header: ${imgUrl}`);
+                                }
+                            }
+
+                            // 3. Send combined message
+                            console.log(`[BOT] Sending product card ${idx + 1}/${cards.length} with image header`);
                             try {
                                 await sendInteractiveMessage(sock, from, {
-                                    text: cardText + '\n\n_Or type the option if buttons don\'t appear._',
-                                    interactiveButtons: wrappedButtons.map(btn => ({
-                                        name: 'quick_reply',
-                                        buttonParamsJson: JSON.stringify({
-                                            display_text: btn.title || btn.text || btn.id,
-                                            id: btn.id
-                                        })
-                                    }))
+                                    interactiveMessage: {
+                                        header,
+                                        body: { text: cardText + '\n\n_Or type the option if buttons don\'t appear._' },
+                                        nativeFlowMessage: {
+                                            buttons: wrappedButtons.map(btn => ({
+                                                name: 'quick_reply',
+                                                buttonParamsJson: JSON.stringify({
+                                                    display_text: btn.title || btn.text || btn.id,
+                                                    id: btn.id
+                                                })
+                                            }))
+                                        }
+                                    }
                                 });
                             } catch (buttonErr) {
-                                console.error(`[BOT] Failed to send product card buttons, falling back to text: ${buttonErr.message}`);
+                                console.error(`[BOT] Failed to send combined product card: ${buttonErr.message}`);
                                 if (cardText) await sock.sendMessage(from, { text: cardText });
                             }
                         }

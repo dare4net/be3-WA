@@ -56,3 +56,8 @@ export function describeInboundMessage(msg) {
     if (!msg || !msg.message) return '';
     return Object.keys(msg.message || {}).join(', ');
 }
+
+export function isImageMessage(msg) {
+    if (!msg || !msg.message) return false;
+    return !!(msg.message.imageMessage);
+}
