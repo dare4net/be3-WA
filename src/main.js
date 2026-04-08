@@ -379,6 +379,13 @@ async function handleMessage(sock, from, text, image = null) {
                     const isGlobalProductCardTx = aiRes.data?.product_card === true || whatsappButtons?.transaction === 'product_card';
                     let consumedFirstImageForTx = false;
 
+                    const globalButtonsHelperText = (aiRes?.data?.whatsapp_buttons && typeof aiRes.data.whatsapp_buttons.helper_text === 'string')
+                        ? aiRes.data.whatsapp_buttons.helper_text.trim()
+                        : '';
+                    const productCardsHelperText = (productCardPayload && typeof productCardPayload.helper_text === 'string')
+                        ? productCardPayload.helper_text.trim()
+                        : '';
+
                     if (whatsappButtons && whatsappButtons.type === 'button' && whatsappButtons.buttons?.length > 0) {
                         let imageTxOk = true;
                         if (isGlobalProductCardTx && hasImages) {
@@ -454,7 +461,7 @@ async function handleMessage(sock, from, text, image = null) {
                                 } catch (_) { }
                             }
                             await sendInteractiveMessage(sock, from, {
-                                text: aiRes.data.reply + '\n\n_Or type Yes / No if buttons don\'t appear._',
+                                text: aiRes.data.reply + (globalButtonsHelperText ? `\n\n${globalButtonsHelperText}` : "\n\n*Tap a button below or type your choice to continue.*"),
                                 interactiveButtons: wrappedButtons.map(btn => ({
                                     name: 'quick_reply',
                                     buttonParamsJson: JSON.stringify({
@@ -541,7 +548,7 @@ async function handleMessage(sock, from, text, image = null) {
                                 await sendInteractiveMessage(sock, from, {
                                     interactiveMessage: {
                                         header,
-                                        body: { text: cardText + '\n\n_Or type the option if buttons don\'t appear._' },
+                                        body: { text: cardText + (productCardsHelperText ? `\n\n${productCardsHelperText}` : "\n\n_Tap a button below — or type your choice to continue._") },
                                         nativeFlowMessage: {
                                             buttons: wrappedButtons.map(btn => ({
                                                 name: 'quick_reply',
