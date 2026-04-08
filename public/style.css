@@ -1,0 +1,120 @@
+body {
+    font-family: Arial, sans-serif;
+    margin: 20px;
+    background-color: #f4f4f4;
+}
+
+h1 {
+    color: #333;
+}
+
+section {
+    background: white;
+    padding: 20px;
+    margin: 20px 0;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+h2 {
+    color: #555;
+    border-bottom: 2px solid #eee;
+    padding-bottom: 10px;
+}
+
+button {
+    padding: 10px 20px;
+    margin: 5px;
+    cursor: pointer;
+    background-color: #007bff;
+    color: white;
+    border: none;
+    border-radius: 4px;
+}
+
+button:hover {
+    background-color: #0056b3;
+}
+
+button:disabled {
+    background-color: #9bb7d6;
+    cursor: not-allowed;
+}
+
+#logs-container {
+    border: 1px solid #ccc;
+    height: 400px;
+    overflow-y: scroll;
+    padding: 10px;
+    background: #f9f9f9;
+    font-family: monospace;
+    white-space: pre-wrap;
+}
+
+.log-entry {
+    margin: 5px 0;
+    padding: 2px 0;
+    border-bottom: 1px solid #eee;
+}
+
+#status {
+    font-weight: bold;
+    text-transform: capitalize;
+}
+
+.status-pill {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 0.9rem;
+    background: #e5e5e5;
+    color: #333;
+}
+
+.status-connected {
+    background: #d6f5dd;
+    color: #1f6b2c;
+}
+
+.status-disconnected {
+    background: #fde1e1;
+    color: #8f1d1d;
+}
+
+.status-awaiting_qr {
+    background: #fff3cd;
+    color: #7a5a00;
+}
+
+.status-error {
+    background: #f8d7da;
+    color: #842029;
+}
+
+.status-unknown {
+    background: #e2e3e5;
+    color: #41464b;
+}
+
+#status-updated,
+#stats-updated,
+#logs-updated {
+    font-variant-numeric: tabular-nums;
+}
+
+.meta {
+    color: #666;
+    font-size: 0.9rem;
+}
+
+.logs-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 10px;
+}
+
+#qr-container canvas {
+    border: 1px solid #ddd;
+    margin-top: 10px;
+}

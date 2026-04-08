@@ -4,6 +4,7 @@ import path from 'path';
 import pino from 'pino';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
+import express from 'express';
 
 import db from './db.js';
 import ContextMemory from './contextMemory.js';
@@ -35,6 +36,18 @@ const { sendInteractiveMessage } = require('baileys_helper');
 // Multi-user state management
 const userSessions = new Map();
 const TRANSLATOR_URL = process.env.TRANSLATOR_URL || 'http://localhost:3004/normalize';
+
+// Frontend variables
+let currentQr = null;
+let connectionStatus = 'disconnected';
+let logs = [];
+let sockInstance = null;
+
+// Stats variables
+let messagesIn = 0;
+let messagesOut = 0;
+let totalSessions = 0;
+let activeSessions = 0;
 
 const uiRegistry = new UiRegistry({ ttlMs: 10 * 60 * 1000, maxEntries: 500 });
 
@@ -79,6 +92,50 @@ function setCachedTranslation(query, data) {
 
 let isConnecting = false;
 
+function log(message) {
+    console.log(message);
+    logs.push({ timestamp: new Date().toISOString(), message });
+    if (logs.length > 1000) logs.shift(); // Keep last 1000 logs
+}
+
+function summarizeOutboundContent(content) {
+    if (!content || typeof content !== 'object') return 'unknown';
+    if (typeof content.text === 'string') {
+        return `text: ${content.text.substring(0, 80)}${content.text.length > 80 ? '…' : ''}`;
+    }
+
+    const flags = [];
+    if (content.image) flags.push('image');
+    if (content.video) flags.push('video');
+    if (content.audio) flags.push('audio');
+    if (content.document) flags.push('document');
+    if (content.sticker) flags.push('sticker');
+    if (content.location) flags.push('location');
+    if (content.contacts) flags.push('contacts');
+    if (content.poll) flags.push('poll');
+    if (content.reaction) flags.push('reaction');
+    if (content.buttons) flags.push('buttons');
+    if (content.templateButtons) flags.push('templateButtons');
+    if (content.listMessage) flags.push('listMessage');
+    if (content.buttonsMessage) flags.push('buttonsMessage');
+
+    if (flags.length === 0) {
+        try {
+            return `payload: ${JSON.stringify(content).substring(0, 120)}${JSON.stringify(content).length > 120 ? '…' : ''}`;
+        } catch (_) {
+            return 'unknown';
+        }
+    }
+
+    return `type: ${flags.join(', ')}`;
+}
+
+async function sendMessage(sock, to, content) {
+    await sock.sendMessage(to, content);
+    messagesOut++;
+    log(`[OUT] to ${to}: ${summarizeOutboundContent(content)}`);
+}
+
 async function connectToWhatsApp() {
     if (isConnecting) return;
     isConnecting = true;
@@ -106,12 +163,15 @@ async function connectToWhatsApp() {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
-                console.log('--- NEW QR CODE GENERATED ---');
-                qrcode.generate(qr, { small: true });
+                log('--- NEW QR CODE GENERATED ---');
+                currentQr = qr;
+                connectionStatus = 'awaiting_qr';
             }
 
             if (connection === 'close') {
                 isConnecting = false;
+                connectionStatus = 'disconnected';
+                currentQr = null;
                 const statusCode = (lastDisconnect.error instanceof Boom)
                     ? lastDisconnect.error.output?.statusCode
                     : null;
@@ -122,11 +182,11 @@ async function connectToWhatsApp() {
                     DisconnectReason.connectionReplaced
                 ]);
                 const shouldReconnect = !nonRecoverable.has(statusCode);
-                console.log(`[BOT] Connection closed. Status: ${statusCode} (${reason}). Reconnecting: ${shouldReconnect}`);
+                log(`[BOT] Connection closed. Status: ${statusCode} (${reason}). Reconnecting: ${shouldReconnect}`);
 
                 if (statusCode === DisconnectReason.connectionReplaced) {
-                    console.log('[BOT] Connection was replaced (usually means this WhatsApp number is logged in somewhere else).');
-                    console.log('[BOT] Fix: close the other session OR delete auth_info_baileys and re-scan QR.');
+                    log('[BOT] Connection was replaced (usually means this WhatsApp number is logged in somewhere else).');
+                    log('[BOT] Fix: close the other session OR delete auth_info_baileys and re-scan QR.');
                 }
 
                 if (shouldReconnect) {
@@ -135,7 +195,10 @@ async function connectToWhatsApp() {
                 }
             } else if (connection === 'open') {
                 isConnecting = false;
-                console.log('✅ WhatsApp connection opened successfully');
+                connectionStatus = 'connected';
+                currentQr = null;
+                sockInstance = sock;
+                log('✅ WhatsApp connection opened successfully');
             }
         });
 
@@ -148,11 +211,12 @@ async function connectToWhatsApp() {
                     if (from === 'status@broadcast') continue;
 
                     if (!msg.key.fromMe && msg.message) {
+                        messagesIn++;
                         const text = extractInboundText(msg);
                         const isImage = isImageMessage(msg);
 
                         if (isImage) {
-                            console.log(`[BOT] Received image from ${from}. Downloading...`);
+                            log(`[BOT] Received image from ${from}. Downloading...`);
                             try {
                                 const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
                                     logger: pino({ level: 'silent' }),
@@ -170,12 +234,13 @@ async function connectToWhatsApp() {
                                 await handleMessage(sock, from, text || '', base64Image);
                             } catch (err) {
                                 console.error('[BOT] Failed to download media:', err);
-                                await sock.sendMessage(from, { text: "I'm sorry, I couldn't process that image. Please try again! 😔" });
+                                await sendMessage(sock, from, { text: "I'm sorry, I couldn't process that image. Please try again! 😔" });
                             }
                         } else if (text) {
+                            log(`[IN] ${from}: ${text}`);
                             await handleMessage(sock, from, text);
                         } else {
-                            console.log(`[BOT] Unhandled inbound message type(s): ${describeInboundMessage(msg)}`);
+                            log(`[BOT] Unhandled inbound message type(s): ${describeInboundMessage(msg)}`);
                         }
                     }
                 }
@@ -269,14 +334,15 @@ async function sendMenu(sock, from) {
         message += `\nJust type what you're looking for, or choose an option above! 😊`;
 
         console.log(`[THOUGHT PROCESS] Final Response (Menu): ${message.substring(0, 100)}...`);
-        await sock.sendMessage(from, { text: message });
+        await sendMessage(sock, from, { text: message });
+        log(`[OUT] Menu sent to ${from}`);
     } catch (err) {
         console.error('❌ Error in sendMenu:', err.message);
         console.error('Stack:', err.stack);
         // Fallback message
         const fallback = `🛍️ *Welcome to Be3!*\n\nYour one-stop shop for everything you need!\n\n*What can I help you with?*\n\n📦 Browse\n🛒 Cart\n📍 Status\n🔍 Search\n\nJust tell me what you're looking for! 😊`;
         console.log(`[THOUGHT PROCESS] Final Response (Menu Fallback): ${fallback.substring(0, 100)}...`);
-        await sock.sendMessage(from, {
+        await sendMessage(sock, from, {
             text: fallback
         });
     }
@@ -295,12 +361,12 @@ async function handleMessage(sock, from, text, image = null) {
         const uiCb = resolveUiCallback(uiRegistry, text);
         if (uiCb?.handled) {
             if (uiCb.error) {
-                await sock.sendMessage(from, { text: 'This option has expired. Please request it again.' });
+                await sendMessage(sock, from, { text: 'This option has expired. Please request it again.' });
                 return;
             }
 
             if (uiCb.action?.type === 'send_text') {
-                await sock.sendMessage(from, { text: uiCb.action.text });
+                await sendMessage(sock, from, { text: uiCb.action.text });
                 return;
             }
 
@@ -319,7 +385,7 @@ async function handleMessage(sock, from, text, image = null) {
         if (command === 'test typing') {
             console.log('[BOT] Test typing command received. Waiting 15s...');
             await new Promise(resolve => setTimeout(resolve, 15000));
-            return sock.sendMessage(from, { text: '✅ Typing test complete! You should have seen "typing..." appear after 3 seconds.' });
+            return sendMessage(sock, from, { text: '✅ Typing test complete! You should have seen "typing..." appear after 3 seconds.' });
         }
 
         // 1. Check for specific numeric shortcuts (add X)
@@ -406,7 +472,7 @@ async function handleMessage(sock, from, text, image = null) {
                                 } else {
                                     try {
                                         console.log(`[BOT] Sending image (tx): ${imgUrl}`);
-                                        await sock.sendMessage(from, {
+                                        await sendMessage(sock, from, {
                                             image: { url: imgUrl },
                                             caption: imgCaption
                                         });
@@ -424,7 +490,8 @@ async function handleMessage(sock, from, text, image = null) {
                         }
 
                         if (isGlobalProductCardTx && !imageTxOk) {
-                            await sock.sendMessage(from, { text: aiRes.data.reply });
+                            await sendMessage(sock, from, { text: aiRes.data.reply });
+                            log(`[OUT] AI reply to ${from}: ${aiRes.data.reply.substring(0, 50)}...`);
                             return;
                         }
 
@@ -475,11 +542,11 @@ async function handleMessage(sock, from, text, image = null) {
                             if (process.env.DEBUG_WA_BUTTONS === 'true') {
                                 console.error('[BOT][DEBUG_WA_BUTTONS] button error stack:', buttonErr?.stack || '(no stack)');
                             }
-                            await sock.sendMessage(from, { text: aiRes.data.reply });
+                            await sendMessage(sock, from, { text: aiRes.data.reply });
                         }
                     } else {
                         // Send plain text message
-                        await sock.sendMessage(from, { text: aiRes.data.reply });
+                        await sendMessage(sock, from, { text: aiRes.data.reply });
                     }
 
                     // Send product cards as a separate message stream after the main reply.
@@ -562,7 +629,7 @@ async function handleMessage(sock, from, text, image = null) {
                                 });
                             } catch (buttonErr) {
                                 console.error(`[BOT] Failed to send combined product card: ${buttonErr.message}`);
-                                if (cardText) await sock.sendMessage(from, { text: cardText });
+                                if (cardText) await sendMessage(sock, from, { text: cardText });
                             }
                         }
                     }
@@ -595,7 +662,7 @@ async function handleMessage(sock, from, text, image = null) {
                                 }
 
                                 console.log(`[BOT] Sending image: ${imgUrl}`);
-                                await sock.sendMessage(from, {
+                                await sendMessage(sock, from, {
                                     image: { url: imgUrl },
                                     caption: imgCaption
                                 });
@@ -678,7 +745,7 @@ async function handleMessage(sock, from, text, image = null) {
         if (command === '1') return browseProducts(sock, from);
         if (command === '2') return viewCart(sock, from);
         if (command === '3') return viewOrderStatus(sock, from);
-        if (command === '4') return sock.sendMessage(from, { text: "🔍 Please type what you're looking for (e.g., 'android phones' or 'laptops') and I'll find it for you!" });
+        if (command === '4') return sendMessage(sock, from, { text: "🔍 Please type what you're looking for (e.g., 'android phones' or 'laptops') and I'll find it for you!" });
 
         // Intent-based routing
         if (['menu', 'hi', 'hello', 'hey', 'start'].includes(intent)) {
@@ -692,13 +759,13 @@ async function handleMessage(sock, from, text, image = null) {
         if (intent === 'checkout') return startCheckout(sock, from);
 
         if (intent === 'help') {
-            return sock.sendMessage(from, { text: "I can help you browse products, manage your cart, and track orders. Just tell me what you need!" });
+            return sendMessage(sock, from, { text: "I can help you browse products, manage your cart, and track orders. Just tell me what you need!" });
         }
 
         // Admin command to clear cache
         if (command === 'clear cache' || command === 'clearcache') {
             translatorCache.clear();
-            return sock.sendMessage(from, { text: "✅ Translator cache cleared!" });
+            return sendMessage(sock, from, { text: "✅ Translator cache cleared!" });
         }
 
         // Handle collecting address state
@@ -820,7 +887,7 @@ async function fetchSemanticProducts(sock, from, parsed, skipMessage = false) {
                 session.lastProducts = [p];
                 if (!skipMessage) {
                     const text = `📦 *${p.name}*\n💰 Price: $${p.price}\n📝 ${p.description || 'No description available.'}\n\n➡️ Type *add 1* to add to cart.`;
-                    return sock.sendMessage(from, { text });
+                    return sendMessage(sock, from, { text });
                 }
                 return;
             }
@@ -892,7 +959,7 @@ async function fetchSemanticProducts(sock, from, parsed, skipMessage = false) {
                         });
                         list += `➡️ Type *add <number>* to add to cart.`;
                         console.log(`[THOUGHT PROCESS] Final Response (Server Fallback): ${list.substring(0, 100)}...`);
-                        return sock.sendMessage(from, { text: list });
+                        return sendMessage(sock, from, { text: list });
                     }
                     return;
                 }
@@ -901,7 +968,7 @@ async function fetchSemanticProducts(sock, from, parsed, skipMessage = false) {
             }
 
             if (!skipMessage) {
-                return sock.sendMessage(from, { text: `I couldn't find any items matching "${base?.term || 'that'}" right now.` });
+                return sendMessage(sock, from, { text: `I couldn't find any items matching "${base?.term || 'that'}" right now.` });
             }
             return;
         }
@@ -916,7 +983,7 @@ async function fetchSemanticProducts(sock, from, parsed, skipMessage = false) {
                 const type = questionWrapper.classifyQuestion(parsed.raw);
                 const response = questionWrapper.formatResponse(type, res.rows, { canonical_term: summary });
                 console.log(`[THOUGHT PROCESS] Final Response (Question): ${response}`);
-                return sock.sendMessage(from, { text: response });
+                return sendMessage(sock, from, { text: response });
             }
 
             let list = `✨ *Found for "${summary}":*\n\n`;
@@ -927,12 +994,12 @@ async function fetchSemanticProducts(sock, from, parsed, skipMessage = false) {
             list += `➡️ Type *add <number>* to add to cart.`;
 
             console.log(`[THOUGHT PROCESS] Final Response (Search): ${list.substring(0, 100)}...`);
-            await sock.sendMessage(from, { text: list });
+            await sendMessage(sock, from, { text: list });
         }
     } catch (err) {
         console.error('Holistic search error:', err);
         if (!skipMessage) {
-            await sock.sendMessage(from, { text: "⚠️ I encountered an error while searching. Please try again with a simpler request!" });
+            await sendMessage(sock, from, { text: "⚠️ I encountered an error while searching. Please try again with a simpler request!" });
         }
     }
 }
@@ -949,7 +1016,7 @@ async function browseProducts(sock, from) {
         session.lastProducts = res.rows;
 
         if (res.rows.length === 0) {
-            return sock.sendMessage(from, { text: "Sorry, we don't have any products available right now." });
+            return sendMessage(sock, from, { text: "Sorry, we don't have any products available right now." });
         }
 
         let list = `✨ *Our Products:*\n\n`;
@@ -959,10 +1026,10 @@ async function browseProducts(sock, from) {
         list += `➡️ Type *add <number>* to add to cart.\nExample: *add 1*`;
 
         console.log(`[THOUGHT PROCESS] Final Response (Browse): ${list.substring(0, 100)}...`);
-        await sock.sendMessage(from, { text: list });
+        await sendMessage(sock, from, { text: list });
     } catch (err) {
         console.error(err);
-        await sock.sendMessage(from, { text: "⚠️ Error loading products." });
+        await sendMessage(sock, from, { text: "⚠️ Error loading products." });
     }
 }
 
@@ -977,7 +1044,7 @@ async function searchProducts(sock, from, query) {
         session.lastProducts = res.rows;
 
         if (res.rows.length === 0) {
-            return sock.sendMessage(from, { text: `No products matching "${query}" were found.` });
+            return sendMessage(sock, from, { text: `No products matching "${query}" were found.` });
         }
 
         let list = `🔍 *Search Results for "${query}":*\n\n`;
@@ -987,10 +1054,10 @@ async function searchProducts(sock, from, query) {
         list += `➡️ Type *add <number>* to add to cart.`;
 
         console.log(`[THOUGHT PROCESS] Final Response (Search Keyword): ${list.substring(0, 100)}...`);
-        await sock.sendMessage(from, { text: list });
+        await sendMessage(sock, from, { text: list });
     } catch (err) {
         console.error(err);
-        await sock.sendMessage(from, { text: "⚠️ Error searching products." });
+        await sendMessage(sock, from, { text: "⚠️ Error searching products." });
     }
 }
 
@@ -1022,7 +1089,7 @@ async function getOrCreateCart(jid) {
 async function addToCart(sock, from, index) {
     const session = getSession(from);
     if (!session.lastProducts || session.lastProducts.length < index || index < 1) {
-        return sock.sendMessage(from, { text: "❌ Invalid product number. Please browse again first." });
+        return sendMessage(sock, from, { text: "❌ Invalid product number. Please browse again first." });
     }
 
     const product = session.lastProducts[index - 1];
@@ -1057,10 +1124,10 @@ async function addToCart(sock, from, index) {
 
         const response = `✅ Added *${product.name}* to your cart!`;
         console.log(`[THOUGHT PROCESS] Final Response (Add to Cart): ${response}`);
-        await sock.sendMessage(from, { text: response });
+        await sendMessage(sock, from, { text: response });
     } catch (err) {
         console.error(err);
-        await sock.sendMessage(from, { text: "⚠️ Failed to add to cart." });
+        await sendMessage(sock, from, { text: "⚠️ Failed to add to cart." });
     }
 }
 
@@ -1075,7 +1142,7 @@ async function viewCart(sock, from) {
         `, [cartId]);
 
         if (res.rows.length === 0) {
-            return sock.sendMessage(from, { text: "Your cart is empty! 🛒" });
+            return sendMessage(sock, from, { text: "Your cart is empty! 🛒" });
         }
 
         let cartText = `🛒 *Your Shopping Cart:*\n\n`;
@@ -1091,10 +1158,10 @@ async function viewCart(sock, from) {
         cartText += `Type *checkout* to complete your order.`;
 
         console.log(`[THOUGHT PROCESS] Final Response (Cart): ${cartText.substring(0, 100)}...`);
-        await sock.sendMessage(from, { text: cartText });
+        await sendMessage(sock, from, { text: cartText });
     } catch (err) {
         console.error(err);
-        await sock.sendMessage(from, { text: "⚠️ Error loading cart." });
+        await sendMessage(sock, from, { text: "⚠️ Error loading cart." });
     }
 }
 
@@ -1102,7 +1169,7 @@ async function startCheckout(sock, from) {
     const session = getSession(from);
     const response = "🚚 Please provide your full name and delivery address to complete the order.";
     console.log(`[THOUGHT PROCESS] Final Response (Checkout Start): ${response}`);
-    await sock.sendMessage(from, { text: response });
+    await sendMessage(sock, from, { text: response });
 }
 
 async function finalizeCheckout(sock, from, address) {
@@ -1121,7 +1188,7 @@ async function finalizeCheckout(sock, from, address) {
 
         if (cartItems.rows.length === 0) {
             session.state = 'idle';
-            return sock.sendMessage(from, { text: "Your cart is empty. Browse products first!" });
+            return sendMessage(sock, from, { text: "Your cart is empty. Browse products first!" });
         }
 
         const subtotal = cartItems.rows.reduce((sum, item) => sum + (item.quantity * item.price), 0);
@@ -1156,10 +1223,10 @@ async function finalizeCheckout(sock, from, address) {
             `Thank you for shopping with us! Type *status* to track your order anytime.`;
 
         console.log(`[THOUGHT PROCESS] Final Response (Order Confirmed): ${successMsg.substring(0, 100)}...`);
-        await sock.sendMessage(from, { text: successMsg });
+        await sendMessage(sock, from, { text: successMsg });
     } catch (err) {
         console.error(err);
-        await sock.sendMessage(from, { text: "⚠️ Checkout failed. Please try again later." });
+        await sendMessage(sock, from, { text: "⚠️ Checkout failed. Please try again later." });
     }
 }
 
@@ -1175,7 +1242,7 @@ async function viewOrderStatus(sock, from) {
         `, [tenantId, from.split('@')[0], from]);
 
         if (res.rows.length === 0) {
-            return sock.sendMessage(from, { text: "You haven't placed any orders yet." });
+            return sendMessage(sock, from, { text: "You haven't placed any orders yet." });
         }
 
         let orderText = `📦 *Your Recent Orders:*\n\n`;
@@ -1184,11 +1251,106 @@ async function viewOrderStatus(sock, from) {
         });
 
         console.log(`[THOUGHT PROCESS] Final Response (Status): ${orderText.substring(0, 100)}...`);
-        await sock.sendMessage(from, { text: orderText });
+        await sendMessage(sock, from, { text: orderText });
     } catch (err) {
         console.error(err);
-        await sock.sendMessage(from, { text: "⚠️ Error checking status." });
+        await sendMessage(sock, from, { text: "⚠️ Error checking status." });
     }
 }
 
 connectToWhatsApp();
+
+// Start Express server for frontend
+const app = express();
+const PORT = process.env.PORT || 3040;
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, '../public')));
+
+app.get('/api/status', (req, res) => {
+    res.json({ status: connectionStatus, qr: currentQr });
+});
+
+app.post('/api/disconnect', async (req, res) => {
+    if (sockInstance) {
+        try {
+            await sockInstance.logout();
+            connectionStatus = 'disconnected';
+            currentQr = null;
+            sockInstance = null;
+            log('[BOT] Manually disconnected');
+            res.json({ success: true });
+        } catch (err) {
+            log(`[BOT] Error disconnecting: ${err.message}`);
+            res.status(500).json({ success: false, error: err.message });
+        }
+    } else {
+        res.status(400).json({ success: false, error: 'Not connected' });
+    }
+});
+
+app.post('/api/reconnect', async (req, res) => {
+    if (!isConnecting && !sockInstance) {
+        connectToWhatsApp();
+        res.json({ success: true });
+    } else {
+        res.status(400).json({ success: false, error: 'Already connecting or connected' });
+    }
+});
+
+app.post('/api/reset-auth', async (req, res) => {
+    try {
+        // Disconnect first if connected
+        if (sockInstance) {
+            await sockInstance.logout();
+            sockInstance = null;
+        }
+        connectionStatus = 'disconnected';
+        currentQr = null;
+        isConnecting = false;
+
+        // Delete auth folder
+        const fs = await import('fs');
+        const path = await import('path');
+        const authPath = path.join(process.cwd(), 'auth_info_baileys');
+        if (fs.existsSync(authPath)) {
+            fs.rmSync(authPath, { recursive: true, force: true });
+            log('[BOT] Auth files deleted');
+        }
+
+        // Start new connection
+        connectToWhatsApp();
+
+        res.json({ success: true, message: 'Auth reset and reconnecting. Check for QR code.' });
+    } catch (err) {
+        log(`[BOT] Error resetting auth: ${err.message}`);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/logs', (req, res) => {
+    res.json(logs.slice(-100)); // Last 100 logs
+});
+
+app.post('/api/logs/clear', (req, res) => {
+    logs = [];
+    res.json({ success: true });
+});
+
+app.get('/api/stats', (req, res) => {
+    res.json({
+        messagesIn,
+        messagesOut,
+        totalSessions: userSessions.size,
+        activeSessions: Array.from(userSessions.values()).filter(s => s.state !== 'idle').length,
+        connectionStatus
+    });
+});
+
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, '../public/index.html'));
+});
+
+app.listen(PORT, () => {
+    log(`[SERVER] Frontend running on http://localhost:${PORT}`);
+});

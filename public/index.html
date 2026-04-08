@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp Bot Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <h1>WhatsApp Bot Dashboard</h1>
+
+    <section id="connection">
+        <h2>Connection Management</h2>
+        <p>Status: <span id="status" class="status-pill status-unknown">Loading...</span></p>
+        <p class="meta">Last updated: <span id="status-updated">--</span></p>
+        <div id="qr-container" style="display: none;">
+            <p>Scan this QR code with WhatsApp:</p>
+            <div id="qr-code"></div>
+            <pre id="qr-text" style="display:none; white-space: pre-wrap; word-break: break-word; margin-top: 10px; background: #f8f8f8; padding: 10px; border: 1px solid #ddd;"></pre>
+        </div>
+        <button id="disconnect-btn">Disconnect</button>
+        <button id="reconnect-btn">Reconnect</button>
+        <button id="reset-auth-btn">Reset Auth</button>
+    </section>
+
+    <section id="stats">
+        <h2>Bot Statistics</h2>
+        <p>Messages In: <span id="messages-in">0</span></p>
+        <p>Messages Out: <span id="messages-out">0</span></p>
+        <p>Total Sessions: <span id="total-sessions">0</span></p>
+        <p>Active Sessions: <span id="active-sessions">0</span></p>
+        <p class="meta">Last updated: <span id="stats-updated">--</span></p>
+    </section>
+
+    <section id="logs">
+        <h2>Logs</h2>
+        <div id="logs-container"></div>
+        <div class="logs-actions">
+            <button id="clear-logs-btn">Clear Logs</button>
+            <span class="meta">Last updated: <span id="logs-updated">--</span></span>
+        </div>
+    </section>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>
