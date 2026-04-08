@@ -14,6 +14,7 @@ import { cleanForTranslator } from './textUtils.js';
 import { describeInboundMessage, extractInboundText, isImageMessage } from './wa/inbound.js';
 import UiRegistry from './ui/uiRegistry.js';
 import { resolveUiCallback } from './ui/callbackRouter.js';
+import { useRedisAuthState } from './wa/redisAuthState.js';
 
 import 'dotenv/config';
 
@@ -42,6 +43,7 @@ let currentQr = null;
 let connectionStatus = 'disconnected';
 let logs = [];
 let sockInstance = null;
+let redisAuth = null;
 
 // Stats variables
 let messagesIn = 0;
@@ -141,7 +143,7 @@ async function connectToWhatsApp() {
     isConnecting = true;
 
     try {
-        const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+        const { state, saveCreds } = await getAuthState();
         const { version, isLatest } = await fetchLatestBaileysVersion();
         console.log(`Using WhatsApp version v${version.join('.')}, isLatest: ${isLatest}`);
 
@@ -1258,6 +1260,30 @@ async function viewOrderStatus(sock, from) {
     }
 }
 
+async function getAuthState() {
+    const isProd = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
+    if (!isProd) {
+        return useMultiFileAuthState('auth_info_baileys');
+    }
+
+    if (!process.env.REDIS_URL) {
+        throw new Error('REDIS_URL is required when NODE_ENV=production');
+    }
+
+    if (!redisAuth) {
+        const keyPrefix = process.env.REDIS_KEY_PREFIX || 'wa:auth';
+        const ttlSec = Number(process.env.REDIS_AUTH_TTL_SEC || 0);
+        redisAuth = await useRedisAuthState({
+            url: process.env.REDIS_URL,
+            keyPrefix,
+            ttlSec: Number.isFinite(ttlSec) ? ttlSec : 0,
+        });
+        log(`[AUTH] Using Redis auth state with prefix "${keyPrefix}"${ttlSec ? ` (TTL ${ttlSec}s)` : ''}`);
+    }
+
+    return redisAuth;
+}
+
 connectToWhatsApp();
 
 // Start Express server for frontend
@@ -1269,6 +1295,18 @@ app.use(express.static(path.join(__dirname, '../public')));
 
 app.get('/api/status', (req, res) => {
     res.json({ status: connectionStatus, qr: currentQr });
+});
+
+app.get('/health', (req, res) => {
+    const status = {
+        ok: true,
+        uptimeSec: Math.floor(process.uptime()),
+        connectionStatus,
+        isConnecting,
+        hasSocket: !!sockInstance,
+        time: new Date().toISOString(),
+    };
+    res.json(status);
 });
 
 app.post('/api/disconnect', async (req, res) => {
@@ -1309,13 +1347,25 @@ app.post('/api/reset-auth', async (req, res) => {
         currentQr = null;
         isConnecting = false;
 
-        // Delete auth folder
-        const fs = await import('fs');
-        const path = await import('path');
-        const authPath = path.join(process.cwd(), 'auth_info_baileys');
-        if (fs.existsSync(authPath)) {
-            fs.rmSync(authPath, { recursive: true, force: true });
-            log('[BOT] Auth files deleted');
+        const isProd = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
+        if (isProd) {
+            if (!redisAuth) {
+                await getAuthState();
+            }
+            if (redisAuth?.clear) {
+                const removed = await redisAuth.clear();
+                log(`[BOT] Redis auth keys deleted (${removed})`);
+            }
+            redisAuth = null;
+        } else {
+            // Delete auth folder
+            const fs = await import('fs');
+            const path = await import('path');
+            const authPath = path.join(process.cwd(), 'auth_info_baileys');
+            if (fs.existsSync(authPath)) {
+                fs.rmSync(authPath, { recursive: true, force: true });
+                log('[BOT] Auth files deleted');
+            }
         }
 
         // Start new connection
