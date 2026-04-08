@@ -144,8 +144,10 @@ async function connectToWhatsApp() {
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             if (type === 'notify') {
                 for (const msg of messages) {
+                    const from = msg.key.remoteJid;
+                    if (from === 'status@broadcast') continue;
+
                     if (!msg.key.fromMe && msg.message) {
-                        const from = msg.key.remoteJid;
                         const text = extractInboundText(msg);
                         const isImage = isImageMessage(msg);
 
@@ -281,6 +283,14 @@ async function sendMenu(sock, from) {
 }
 
 async function handleMessage(sock, from, text, image = null) {
+    let typingTimer = setTimeout(async () => {
+        try {
+            await sock.sendPresenceUpdate('composing', from);
+        } catch (err) {
+            console.error('[BOT] Failed to send typing indicator:', err);
+        }
+    }, 3000); // 3 seconds
+
     try {
         const uiCb = resolveUiCallback(uiRegistry, text);
         if (uiCb?.handled) {
@@ -306,6 +316,12 @@ async function handleMessage(sock, from, text, image = null) {
         const cleanedText = cleanForTranslator(rawText);
         const command = cleanedText.toLowerCase();
 
+        if (command === 'test typing') {
+            console.log('[BOT] Test typing command received. Waiting 15s...');
+            await new Promise(resolve => setTimeout(resolve, 15000));
+            return sock.sendMessage(from, { text: '✅ Typing test complete! You should have seen "typing..." appear after 3 seconds.' });
+        }
+
         // 1. Check for specific numeric shortcuts (add X)
         if (command.startsWith('add ')) {
             const index = parseInt(command.split(' ')[1]);
@@ -326,7 +342,8 @@ async function handleMessage(sock, from, text, image = null) {
 
                 console.log(`[BOT] Routing message to AI Agent... History Size: ${session.history.length}`);
 
-                const aiRes = await axios.post('http://localhost:3005/chat', {
+                const AI_AGENT_URL = process.env.AI_AGENT_URL || 'http://localhost:3005';
+                const aiRes = await axios.post(`${AI_AGENT_URL}/chat`, {
                     message: rawText,
                     image: image,
                     session_id: from,
@@ -688,6 +705,8 @@ async function handleMessage(sock, from, text, image = null) {
 
     } catch (err) {
         console.error('❌ FATAL Error in handleMessage:', err);
+    } finally {
+        clearTimeout(typingTimer);
     }
 }
 
